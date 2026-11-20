@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-APP, VER = "BlazeLauncher", "1.0.0"
+APP, VER = "BlazeLauncher", "1.0.1"
 BASE = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), ".blazelauncher")
 MC = os.path.join(BASE, "minecraft")
 GAME = os.path.join(BASE, "game")
@@ -314,6 +314,10 @@ def find_java(need, cfg, status):
     if os.environ.get("JAVA_HOME"):
         cands.append(os.path.join(os.environ["JAVA_HOME"], "bin", "java.exe"))
     cands.append(shutil.which("java") or "")
+    mcrt = os.path.join(os.environ.get("APPDATA", ""), ".minecraft", "runtime")
+    for root, _, files in os.walk(mcrt):
+        if "java.exe" in files:
+            cands.append(os.path.join(root, "java.exe"))
     for pf in (os.environ.get("ProgramFiles", ""), os.environ.get("ProgramFiles(x86)", "")):
         for sub in ("Java", "Eclipse Adoptium", "Microsoft", "Zulu", "BellSoft"):
             cands += glob.glob(os.path.join(pf, sub, "*", "bin", "java.exe"))
