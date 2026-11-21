@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """BlazeLauncher - a small Minecraft launcher. Pure Python stdlib, works on Windows 7-11 (Python 3.8+)."""
 import os, sys, re, json, time, uuid, shutil, hashlib, zipfile, queue, glob, platform, threading
-import base64, subprocess, traceback, urllib.request, urllib.parse, urllib.error
+import base64, subprocess, traceback, urllib.request, urllib.parse, urllib.error, io
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-APP, VER = "BlazeLauncher", "1.3.0"
+APP, VER = "BlazeLauncher", "1.4.0"
 BASE = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), ".blazelauncher")
 MC = os.path.join(BASE, "minecraft")
 GAME = os.path.join(BASE, "game")
@@ -20,7 +21,8 @@ BG, PANEL, CARD, EDGE = "#0f0c0a", "#17120f", "#201a15", "#2e261f"
 ORANGE, ORANGE2, TEXT, MUTED = "#ff7a1a", "#ff9a4a", "#f4ede5", "#9b9086"
 
 DEFAULT = {"mode": "offline", "name": "Player", "ram": 2048, "java": "", "snapshots": False,
-           "fabric": False, "version": "", "client_id": "", "ms": {}, "friends": [], "shortcut_done": False}
+           "fabric": False, "version": "", "client_id": "", "ms": {}, "friends": [], "shortcut_done": False,
+           "hide": True}
 
 
 # ---------------------------------------------------------------- config / http
@@ -425,6 +427,7 @@ def install_shortcuts():
 
 # ---------------------------------------------------------------- mods / news helpers
 MODS = os.path.join(GAME, "mods")
+PACKS = os.path.join(GAME, "resourcepacks")
 
 
 def list_mods():
@@ -441,6 +444,137 @@ def toggle_mod(name):
     src = os.path.join(MODS, name)
     dst = src[:-9] if name.lower().endswith(".disabled") else src + ".disabled"
     os.replace(src, dst)
+
+
+def _vt(s):
+    """'1.20.1' -> (1, 20, 1). None when it is not a plain numeric version (snapshots and the like)."""
+    if not re.match(r"^\d+(\.\d+)*$", s):
+        return None
+    t = tuple(int(x) for x in s.split("."))
+    return t + (0,) * (3 - len(t))
+
+
+def _cmp(a, b):
+    n = max(len(a), len(b))
+    a, b = a + (0,) * (n - len(a)), b + (0,) * (n - len(b))
+    return (a > b) - (a < b)
+
+
+def mc_range_ok(spec, mcver):
+    """Check a Fabric 'minecraft' dependency such as '>=1.20 <1.21', '~1.20.1' or '1.20.x'. True when unsure."""
+    cur = _vt(mcver)
+    if cur is None:
+        return True
+    for alt in spec.split("||"):
+        alt = re.sub(r"(>=|<=|>|<|=|~|\^)\s+", r"\1", alt.strip())
+        ok = True
+        for tok in alt.split():
+            m = re.match(r"^(>=|<=|>|<|=|~|\^)?(.*)$", tok)
+            op, v = m.group(1) or "=", m.group(2)
+            if v in ("", "*"):
+                continue
+            if re.search(r"[xX*]", v):
+                if op == "=":
+                    pre = tuple(int(x) for x in v.split(".") if x.isdigit())
+                    if tuple(cur[:len(pre)]) != pre:
+                        ok = False
+                continue
+            t = _vt(v)
+            if t is None:
+                return True
+            c = _cmp(cur, t)
+            if op == "=":
+                good = c == 0
+            elif op == ">=":
+                good = c >= 0
+            elif op == ">":
+                good = c > 0
+            elif op == "<=":
+                good = c <= 0
+            elif op == "<":
+                good = c < 0
+            elif op == "~":
+                top = (t[0], t[1] + 1, 0) if len(v.split(".")) >= 2 else (t[0] + 1, 0, 0)
+                good = c >= 0 and _cmp(cur, top) < 0
+            else:
+                good = c >= 0 and _cmp(cur, (t[0] + 1, 0, 0)) < 0
+            if not good:
+                ok = False
+        if ok:
+            return True
+    return False
+
+
+def mod_info(src):
+    """Read a mod jar (path or bytes): dict(kind, id, provides, depends, nested)."""
+    with zipfile.ZipFile(io.BytesIO(src) if isinstance(src, bytes) else src) as z:
+        names = set(z.namelist())
+        if "fabric.mod.json" in names:
+            j = json.loads(z.read("fabric.mod.json").decode("utf-8-sig"), strict=False)
+            nested = []
+            for e in j.get("jars", []) or []:
+                f = e.get("file") if isinstance(e, dict) else None
+                if f and f in names:
+                    nested.append(z.read(f))
+            deps = j.get("depends", {})
+            return {"kind": "fabric", "id": j.get("id", "?"), "provides": list(j.get("provides", []) or []),
+                    "depends": deps if isinstance(deps, dict) else {}, "nested": nested}
+        kind = "unknown"
+        if "quilt.mod.json" in names:
+            kind = "quilt"
+        elif "META-INF/mods.toml" in names or "META-INF/neoforge.mods.toml" in names or "mcmod.info" in names:
+            kind = "forge"
+        return {"kind": kind, "id": "", "provides": [], "depends": {}, "nested": []}
+
+
+def mod_ids(info):
+    ids = {info["id"], *info["provides"]}
+    for blob in info["nested"]:
+        try:
+            ids |= mod_ids(mod_info(blob))
+        except Exception:
+            pass
+    return ids
+
+
+def check_mods(mcver, fabric):
+    """Look at the enabled mods before launch. Returns a list of plain-language problems (may be empty)."""
+    problems, infos = [], []
+    try:
+        mods = [m for m in list_mods() if not m[1]]
+    except Exception:
+        return problems
+    for name, _, _ in mods:
+        try:
+            infos.append((name, mod_info(os.path.join(MODS, name))))
+        except Exception as e:
+            problems.append("%s cannot be read (%s). The file may be damaged: download it again" % (name, e))
+    if not infos:
+        return problems
+    if not fabric and any(i["kind"] == "fabric" for _, i in infos):
+        problems.append("Fabric is switched off on the Home tab, so your Fabric mods will not load")
+    ids = set()
+    for _, i in infos:
+        ids |= mod_ids(i)
+    for name, i in infos:
+        if i["kind"] == "forge":
+            problems.append("%s is a Forge/NeoForge mod. BlazeLauncher only runs Fabric mods" % name)
+        if i["kind"] != "fabric":
+            continue
+        for dep, spec in i["depends"].items():
+            specs = spec if isinstance(spec, list) else [spec]
+            if dep == "minecraft":
+                if not any(isinstance(s, str) and mc_range_ok(s, mcver) for s in specs):
+                    problems.append("%s is not made for Minecraft %s (it needs %s)" % (
+                        name, mcver, " or ".join(str(s) for s in specs)))
+            elif dep in ("java", "fabricloader", "fabric-loader") or dep in ids:
+                continue
+            elif re.match(r"^fabric(-api)?$|^fabric-.+-v\d+$|^fabric-api-base$", dep):
+                if not ({"fabric-api", "fabric"} & ids):
+                    problems.append("%s needs Fabric API. Install it from the Modrinth tab" % name)
+            else:
+                problems.append("%s needs the mod '%s', which is not installed" % (name, dep))
+    return list(dict.fromkeys(problems))
 
 
 def fetch_news():
@@ -731,6 +865,33 @@ class App:
             pass
         self.root.after(50, self.pump)
 
+    def ask(self, text):
+        """Ask a yes/no question from a worker thread and wait for the answer."""
+        box, ev = [], threading.Event()
+
+        def w():
+            try:
+                box.append(messagebox.askyesno(APP, text))
+            finally:
+                ev.set()
+        self.ui(w)
+        ev.wait()
+        return bool(box and box[0])
+
+    def hide_window(self):
+        try:
+            self.root.withdraw()
+        except tk.TclError:
+            pass
+
+    def show_again(self):
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+
     def log(self, s):
         def w():
             self.logbox.config(state="normal")
@@ -852,7 +1013,8 @@ class App:
         row = tk.Frame(left, bg=BG)
         row.pack(anchor="w", pady=16)
         RBtn(row, "Game folder", lambda: self.open_dir(GAME), 130, 36, CARD, "#2c241d", TEXT).pack(side="left", padx=(0, 10))
-        RBtn(row, "Mods folder", lambda: self.open_dir(MODS), 130, 36, CARD, "#2c241d", TEXT).pack(side="left")
+        RBtn(row, "Mods folder", lambda: self.open_dir(MODS), 130, 36, CARD, "#2c241d", TEXT).pack(side="left", padx=(0, 10))
+        RBtn(row, "Resource packs", lambda: self.open_dir(PACKS), 150, 36, CARD, "#2c241d", TEXT).pack(side="left")
         self.home_friends = self.panel(right, "Friends")
         self.news_box = self.panel(right, "Recent news")
         self.lbl(self.news_box, "Loading...", 10, MUTED, False, CARD).pack(anchor="w")
@@ -1111,6 +1273,8 @@ class App:
         RBtn(row, "Browse", lambda: self.java.set(filedialog.askopenfilename(
             filetypes=[("java.exe", "java.exe")]) or self.java.get()), 90, 32, EDGE, "#3a3028", TEXT,
             outer=CARD).pack(side="left", padx=10)
+        self.hide = tk.BooleanVar(value=self.cfg.get("hide", True))
+        self.check(c, "Hide the launcher while Minecraft is running", self.hide).pack(anchor="w", padx=14, pady=(16, 0))
         RBtn(c, "Create desktop shortcut", self.make_shortcut, 200, 34, EDGE, "#3a3028", TEXT,
              outer=CARD).pack(anchor="w", padx=18, pady=(18, 0))
         self.lbl(c, "Data folder: " + BASE, 9, MUTED, False, CARD).pack(anchor="w", padx=18, pady=16)
@@ -1160,7 +1324,7 @@ class App:
         c = self.cfg
         c.update(mode=self.mode.get(), name=self.name.get().strip(), client_id=self.cid.get().strip(),
                  ram=int(self.ram.get() or 2048), java=self.java.get().strip(), fabric=self.fab.get(),
-                 snapshots=self.snap.get(), version=self.ver.get())
+                 snapshots=self.snap.get(), version=self.ver.get(), hide=self.hide.get())
         save_cfg(c)
         self.update_account_card()
 
@@ -1214,6 +1378,19 @@ class App:
                 name, uid, token, utype = ms["name"], ms["uuid"], ms["token"], "msa"
             else:
                 name, uid, token, utype = c["name"], offline_uuid(c["name"]), "0", "legacy"
+            mod_problems = []
+            try:
+                mod_problems = check_mods(c["version"], c["fabric"])
+            except Exception:
+                self.log(traceback.format_exc())
+            for pr in mod_problems:
+                self.log("MOD PROBLEM: " + pr)
+            if mod_problems:
+                shown = "\n".join("- " + pr for pr in mod_problems[:8])
+                more = "\n(and %d more, see the Log tab)" % (len(mod_problems) - 8) if len(mod_problems) > 8 else ""
+                if not self.ask("Possible problems with your mods:\n\n%s%s\n\nLaunch anyway?" % (shown, more)):
+                    self.status("Launch cancelled", 0)
+                    return
             v, vid, cp, natdir, assets_root = prepare(c["version"], c["fabric"], self.manifest, self.status)
             need = v.get("javaVersion", {}).get("majorVersion", 8)
             java = find_java(need, c, self.status)
@@ -1231,15 +1408,30 @@ class App:
             shown = " ".join(cmd)
             self.log("CMD: " + (shown.replace(token, "***") if token != "0" else shown))
             p = subprocess.Popen(cmd, cwd=GAME, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=NOWIN)
+            if c.get("hide", True):
+                self.ui(self.hide_window)
+            tail = deque(maxlen=30)
             for line in p.stdout:
-                self.log(line.decode("utf-8", "replace").rstrip())
-            self.status("Game closed (exit code %s)" % p.wait(), 0)
+                s = line.decode("utf-8", "replace").rstrip()
+                tail.append(s)
+                self.log(s)
+            code = p.wait()
+            self.ui(self.show_again)
+            self.status("Game closed (exit code %s)" % code, 0)
+            if code != 0:
+                msg = "Minecraft closed with an error (exit code %s).\n\nLast lines of the game output:\n%s" % (
+                    code, "\n".join(list(tail)[-12:]))
+                if mod_problems:
+                    msg += "\n\nPossible mod problems:\n" + "\n".join("- " + pr for pr in mod_problems[:6])
+                self.ui(messagebox.showerror, APP, msg)
         except Exception as e:
             self.log(traceback.format_exc())
             self.status("Error", 0)
+            self.ui(self.show_again)
             self.ui(messagebox.showerror, APP, str(e))
         finally:
             self.busy = False
+            self.ui(self.root.deiconify)
             self.ui(self.play_btn.enable, True)
 
     def close(self):
