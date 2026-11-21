@@ -15,7 +15,7 @@ jobs:
           python-version: "3.8"
           architecture: x64
       - run: pip install pyinstaller==5.13.2
-      - run: pyinstaller --onefile --windowed --name BlazeLauncher launcher.py
+      - run: pyinstaller --onefile --windowed --icon icon.ico --add-data "icon.ico;." --name BlazeLauncher launcher.py
       - uses: actions/upload-artifact@v4
         with:
           name: BlazeLauncher-exe
